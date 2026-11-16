@@ -1,0 +1,380 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { PerspectiveCamera, Raycaster, Vector3 } from "three";
+import { FigureView } from "./figure.ts";
+import { faceLandmarks, shapedLandmarks } from "./face.ts";
+import { fabrik, solveElbow } from "./ik.ts";
+import { flattenKeys, openPoseJson, type PersonPose } from "./openpose.ts";
+import { animaOutline, animaStrokePx } from "./outline.ts";
+import { encodePngRGB, linearRgbToSrgb } from "./png.ts";
+import { mirrorPose, jointNames, jointsToPose, poseToJoints, nearestEuler, limitsFor } from "./pose.ts";
+import { projectToPixel } from "./project.ts";
+import { headLength, layoutFigure, statureOf, footHeel, TOE_DIGITS } from "./proportions.ts";
+import { exportCameraFit, snapResolution } from "./resolution.ts";
+import { clone, defaultScene, makeFigure } from "./state.ts";
+import type { BodyParams } from "./types.ts";
+import { encodeZip } from "./zip.ts";
+
+const adult: BodyParams = {
+  sex: 1,
+  age: 30,
+  heightCm: 175,
+  mass: 0.4,
+  muscle: 0.4,
+  shoulder: 1,
+  hip: 1,
+  torso: 1,
+  leg: 1,
+};
+
+describe("proportions", () => {
+  it("stacks a figure to the requested height", () => {
+    const segs = layoutFigure(adult);
+    assert.ok(Math.abs(statureOf(segs) - 1.75) < 0.015);
+  });
+
+  it("gives children a larger head share than adults", () => {
+    const child = layoutFigure({ ...adult, age: 6, heightCm: 115, sex: 0.5 });
+    const grown = layoutFigure(adult);
+    const childShare = headLength(child) / statureOf(child);
+    const adultShare = headLength(grown) / statureOf(grown);
+    assert.ok(childShare > adultShare + 0.02, `${childShare} vs ${adultShare}`);
+  });
+
+  it("widens male shoulders relative to female at the same height", () => {
+    const span = (sex: number) => {
+      const segs = layoutFigure({ ...adult, sex });
+      const left = segs.find((s) => s.name === "upperArm.L");
+      const right = segs.find((s) => s.name === "upperArm.R");
+      if (!left || !right) throw new Error("missing arms");
+      return Math.abs(left.head.x - right.head.x);
+    };
+    assert.ok(span(1) > span(0));
+  });
+
+  it("puts the figure's right arm on -X", () => {
+    const segs = layoutFigure(adult);
+    const right = segs.find((s) => s.name === "upperArm.R");
+    const left = segs.find((s) => s.name === "upperArm.L");
+    if (!right || !left) throw new Error("missing arms");
+    assert.ok(right.head.x < 0);
+    assert.ok(left.head.x > 0);
+  });
+
+  it("gives each foot a heel and five jointed toes", () => {
+    const segs = layoutFigure(adult);
+    const foot = segs.find((s) => s.name === "foot.L");
+    if (!foot) throw new Error("missing foot");
+    const heel = footHeel(foot);
+    if (!heel) throw new Error("missing heel");
+    assert.ok(heel.center.z < foot.head.z, "heel sits behind the ankle");
+    assert.ok(Math.abs(heel.center.y - heel.ry - (foot.tail.y - foot.rz1)) < 0.004, "heel sole meets the ball");
+    assert.equal(segs.some((s) => s.name === "hallux3.L"), false);
+    for (const side of ["L", "R"] as const) {
+      let bones = 0;
+      for (const digit of TOE_DIGITS) {
+        for (let i = 1; i <= digit.bones; i++) {
+          const seg = segs.find((s) => s.name === `${digit.name}${i}.${side}`);
+          assert.ok(seg, `${digit.name}${i}.${side}`);
+          assert.equal(seg.parent, i === 1 ? `foot.${side}` : `${digit.name}${i - 1}.${side}`);
+          bones += 1;
+        }
+      }
+      assert.equal(bones, 14);
+    }
+    const hallux = segs.find((s) => s.name === "hallux1.L")!;
+    const fifth = segs.find((s) => s.name === "fifth1.L")!;
+    const ankle = foot.head.x;
+    assert.ok(Math.abs(hallux.head.x) < Math.abs(fifth.head.x), "big toe is medial");
+    assert.ok(hallux.head.x < ankle && fifth.head.x > ankle);
+    const tip = segs.find((s) => s.name === "hallux2.L")!;
+    assert.ok(tip.tail.z > foot.tail.z);
+    const second = segs.find((s) => s.name === "second1.L")!;
+    const gap = second.head.x - hallux.head.x;
+    assert.ok(gap > hallux.rx0 + second.rx0 * 0.35, `toes overlap too much (${gap})`);
+    const limL = limitsFor("hallux1.L");
+    const limR = limitsFor("hallux1.R");
+    assert.deepEqual(limL?.x, limR?.x);
+    assert.deepEqual(limL?.y, limR ? [-limR.y[1], -limR.y[0]] : null);
+    assert.ok(limitsFor("second1.L")!.x[1] >= 48);
+    const names = jointNames();
+    assert.ok(names.includes("hallux2.L"));
+    assert.ok(names.includes("fifth3.R"));
+    assert.equal(new Set(names).size, names.length);
+  });
+
+  it("drops the toe bones for the original foot", () => {
+    const segs = layoutFigure(adult, false);
+    assert.equal(segs.some((s) => s.name.startsWith("hallux")), false);
+    const foot = segs.find((s) => s.name === "foot.L");
+    assert.equal(foot?.kind, "box");
+    assert.equal(footHeel(foot!), null);
+    const view = new FigureView(makeFigure(1, "adult-m"));
+    assert.equal(view.bones.has("hallux1.L"), false);
+    view.data.detailedFeet = true;
+    view.rebuild(true);
+    assert.equal(view.bones.has("hallux2.L"), true);
+    assert.equal(view.bones.has("fifth3.R"), true);
+    view.data.detailedFeet = false;
+    view.rebuild(true);
+    assert.equal(view.bones.has("hallux1.L"), false);
+    assert.equal(view.bones.has("foot.L"), true);
+    assert.equal(view.markers.has("hallux1.L"), false);
+  });
+
+  it("splits the torso into lower, mid, and chest", () => {
+    const segs = layoutFigure(adult);
+    const byName = new Map(segs.map((s) => [s.name, s]));
+    const spine = byName.get("spine");
+    const abdomen = byName.get("abdomen");
+    const chest = byName.get("chest");
+    const neck = byName.get("neck");
+    if (!spine || !abdomen || !chest || !neck) throw new Error("missing torso");
+    assert.equal(spine.parent, "hips");
+    assert.equal(abdomen.parent, "spine");
+    assert.equal(chest.parent, "abdomen");
+    assert.equal(neck.parent, "chest");
+    assert.ok(Math.abs(spine.tail.y - abdomen.head.y) < 1e-6);
+    assert.ok(Math.abs(abdomen.tail.y - chest.head.y) < 1e-6);
+    assert.ok(Math.abs(chest.tail.y - neck.head.y) < 1e-6);
+    for (const seg of [spine, abdomen, chest]) {
+      const len = seg.tail.y - seg.head.y;
+      assert.ok(len > 0.08, `${seg.name} is too short (${len})`);
+    }
+    const order = jointNames();
+    assert.equal(order.indexOf("abdomen"), order.indexOf("spine") + 1);
+    assert.equal(order.indexOf("chest"), order.indexOf("abdomen") + 1);
+  });
+});
+
+describe("projection and openpose sides", () => {
+  it("projects a point in front of the camera to the center", () => {
+    const cam = new PerspectiveCamera(90, 1, 0.1, 50);
+    cam.position.set(0, 0, 5);
+    cam.lookAt(0, 0, 0);
+    cam.updateMatrixWorld();
+    cam.updateProjectionMatrix();
+    const px = projectToPixel(new Vector3(0, 0, 0), cam, 200, 200);
+    assert.equal(px.behind, false);
+    assert.ok(Math.abs(px.x - 100) < 1);
+    assert.ok(Math.abs(px.y - 100) < 1);
+  });
+
+  it("puts the figure's right wrist on the image left when it faces the camera", () => {
+    const view = new FigureView(makeFigure(1, "adult-m"));
+    view.data.pose = {};
+    view.updateSkeleton(false, null);
+    const cam = new PerspectiveCamera(40, 1, 0.1, 40);
+    cam.position.set(0, 1, 5);
+    cam.lookAt(0, 1, 0);
+    cam.updateMatrixWorld();
+    cam.updateProjectionMatrix();
+    const pose = view.samplePose(cam, 512, 512, false, new Raycaster());
+    const rightWrist = pose.body[4];
+    const leftWrist = pose.body[7];
+    assert.equal(rightWrist.c, 1);
+    assert.equal(leftWrist.c, 1);
+    assert.ok(rightWrist.x < leftWrist.x, `right ${rightWrist.x} left ${leftWrist.x}`);
+    assert.equal(pose.handL.length, 21);
+    assert.equal(pose.handR.length, 21);
+    assert.equal(pose.face.length, 68);
+    view.dispose();
+  });
+});
+
+describe("openpose json", () => {
+  it("writes flat COCO-18 plus optional hands and face", () => {
+    const zeros = (n: number) => Array.from({ length: n }, () => ({ x: 1, y: 2, c: 1 }));
+    const person: PersonPose = { body: zeros(18), handL: zeros(21), handR: zeros(21), face: zeros(68) };
+    const parsed = JSON.parse(openPoseJson([person], 768, 768, true)) as {
+      version: number;
+      canvas_width: number;
+      canvas_height: number;
+      people: {
+        pose_keypoints_2d: number[];
+        face_keypoints_2d: number[];
+        hand_left_keypoints_2d: number[];
+        hand_right_keypoints_2d: number[];
+      }[];
+    };
+    assert.equal(parsed.version, 1.3);
+    assert.equal(parsed.canvas_width, 768);
+    assert.equal(parsed.canvas_height, 768);
+    assert.equal(parsed.people[0].pose_keypoints_2d.length, 54);
+    assert.equal(parsed.people[0].hand_left_keypoints_2d.length, 63);
+    assert.equal(parsed.people[0].hand_right_keypoints_2d.length, 63);
+    assert.equal(parsed.people[0].face_keypoints_2d.length, 204);
+    assert.deepEqual(parsed.people[0].pose_keypoints_2d.slice(0, 3), [1, 2, 1]);
+    assert.deepEqual(flattenKeys([], 2), [0, 0, 0, 0, 0, 0]);
+  });
+});
+
+describe("resolution", () => {
+  it("snaps to multiples of 8 and warns off the 64 grid", () => {
+    const snapped = snapResolution(100, 100);
+    assert.equal(snapped.width % 8, 0);
+    assert.equal(snapped.height % 8, 0);
+    assert.equal(snapped.snapped, true);
+    assert.equal(snapResolution(512, 768).warn64, false);
+    assert.equal(snapResolution(520, 512).warn64, true);
+  });
+
+  it("crops a square export out of a wide view without changing vertical fov", () => {
+    const fit = exportCameraFit(1600, 900, 512, 512, 50);
+    assert.equal(fit.fov, 50);
+    assert.ok(fit.w < 1600);
+    assert.ok(Math.abs(fit.h - 900) < 1);
+  });
+});
+
+describe("serialization", () => {
+  it("round-trips scene state through JSON", () => {
+    const scene = defaultScene();
+    const copy = clone(scene);
+    assert.equal(copy.figures.length, 1);
+    assert.equal(copy.figures[0].params.heightCm, scene.figures[0].params.heightCm);
+    assert.equal(copy.figures[0].pose["upperArm.L"]?.z, scene.figures[0].pose["upperArm.L"]?.z);
+  });
+
+  it("mirrors limb euler signs", () => {
+    const mirrored = mirrorPose({ "upperArm.L": { x: 1, y: 2, z: -72 } }, "L2R");
+    assert.deepEqual(mirrored["upperArm.R"], { x: 1, y: -2, z: 72 });
+  });
+
+  it("round-trips a full joint-angle table", () => {
+    const names = jointNames();
+    assert.ok(names.includes("spine"));
+    assert.ok(names.includes("abdomen"));
+    assert.ok(names.includes("thumb3.R"));
+    assert.equal(new Set(names).size, names.length);
+    const pose = jointsToPose([{ name: "upperArm.L", x: 0, y: 1, z: -42 }]);
+    const back = poseToJoints(pose);
+    assert.deepEqual(
+      back.find((j) => j.name === "upperArm.L"),
+      { name: "upperArm.L", x: 0, y: 1, z: -42 },
+    );
+    assert.deepEqual(
+      back.find((j) => j.name === "hips"),
+      { name: "hips", x: 0, y: 0, z: 0 },
+    );
+  });
+
+  it("lets the upper arm twist past 90 degrees", () => {
+    const lim = limitsFor("upperArm.L");
+    assert.ok(lim);
+    assert.ok(lim.x[0] <= -160);
+    assert.ok(lim.x[1] >= 160);
+    const kept = nearestEuler({ x: 10, y: 170, z: 10 }, { x: 190, y: 10, z: 190 });
+    assert.ok(Math.abs(kept.x - 190) < 1);
+    assert.ok(Math.abs(kept.y - 10) < 1);
+    assert.ok(Math.abs(kept.z - 190) < 1);
+  });
+});
+
+describe("files", () => {
+  it("encodes an 8-bit RGB png", () => {
+    const png = encodePngRGB(8, 8, new Uint8Array(8 * 8 * 3).fill(10));
+    assert.equal(png[0], 137);
+    assert.equal(png[1], 80);
+    assert.equal(String.fromCharCode(...png.subarray(12, 16)), "IHDR");
+    assert.equal((png[16] << 24) | (png[17] << 16) | (png[18] << 8) | png[19], 8);
+  });
+
+  it("maps linear mid-gray to a brighter sRGB byte", () => {
+    const out = linearRgbToSrgb(new Uint8Array([0, 128, 255]));
+    assert.equal(out[0], 0);
+    assert.equal(out[2], 255);
+    assert.ok(out[1] > 170 && out[1] < 200, String(out[1]));
+  });
+
+  it("stores a zip entry", () => {
+    const zip = encodeZip([{ name: "openpose.png", data: new Uint8Array([1, 2, 3, 4]) }]);
+    assert.equal(zip[0], 0x50);
+    assert.equal(zip[1], 0x4b);
+    const text = new TextDecoder().decode(zip);
+    assert.ok(text.includes("openpose.png"));
+  });
+});
+
+describe("ik", () => {
+  it("reaches a target two segments away", () => {
+    const solved = fabrik(
+      [new Vector3(0, 0, 0), new Vector3(0, 1, 0), new Vector3(0, 2, 0)],
+      [1, 1],
+      new Vector3(0, 0, 2),
+      12,
+    );
+    assert.ok(solved[2].distanceTo(new Vector3(0, 0, 2)) < 0.05);
+  });
+
+  it("keeps bone lengths in a two-bone solve", () => {
+    const elbow = solveElbow(new Vector3(0, 0, 0), new Vector3(1.2, 0.2, 0.4), 0.8, 0.7, new Vector3(0, 0, -1), new Vector3());
+    const root = new Vector3(0, 0, 0);
+    const target = new Vector3(1.2, 0.2, 0.4);
+    const d1 = elbow.distanceTo(root);
+    const d2 = elbow.distanceTo(target);
+    assert.ok(Math.abs(d1 - 0.8) < 0.05, `upper ${d1}`);
+    assert.ok(d2 < 0.75);
+  });
+});
+
+describe("face", () => {
+  it("has 68 landmarks", () => {
+    assert.equal(faceLandmarks(0.22).length, 68);
+  });
+
+  it("keeps a neutral face on the rest landmarks and opens the jaw", () => {
+    const rest = faceLandmarks(0.22);
+    const neutral = shapedLandmarks(0.22, { jaw: 0, smile: 0, brow: 0, blink: 0, mouth: 1 });
+    assert.equal(neutral.length, 68);
+    assert.ok(Math.abs(neutral[8].y - rest[8].y) < 1e-6);
+    const open = shapedLandmarks(0.22, { jaw: 1, smile: 0, brow: 0, blink: 0, mouth: 1 });
+    assert.ok(open[8].y < rest[8].y);
+    const shut = shapedLandmarks(0.22, { jaw: 0, smile: 0, brow: 0, blink: 1, mouth: 1 });
+    const span = (pts: { y: number }[], a: number, b: number) => {
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let i = a; i <= b; i++) {
+        lo = Math.min(lo, pts[i].y);
+        hi = Math.max(hi, pts[i].y);
+      }
+      return hi - lo;
+    };
+    assert.ok(span(shut, 36, 41) < span(rest, 36, 41));
+  });
+});
+
+describe("anima outline", () => {
+  it("uses a 4px stroke at a 768 short side", () => {
+    assert.equal(animaStrokePx(768, 1152), 4);
+    assert.equal(animaStrokePx(1536, 1024), 5);
+  });
+
+  it("draws a complementary edge and keeps the interior", () => {
+    const w = 12;
+    const h = 12;
+    const color = new Uint8Array(w * h * 3);
+    const depth = new Uint8Array(w * h * 3);
+    const mask = new Uint8Array(w * h * 3);
+    for (let y = 2; y < 10; y++) {
+      for (let x = 2; x < 10; x++) {
+        const o = (y * w + x) * 3;
+        color[o] = 200;
+        color[o + 1] = 160;
+        color[o + 2] = 80;
+        depth[o] = depth[o + 1] = depth[o + 2] = x < 6 ? 200 : 40;
+        mask[o] = 10;
+        mask[o + 1] = 200;
+        mask[o + 2] = 10;
+      }
+    }
+    const out = animaOutline(color, depth, mask, w, h);
+    const at = (x: number, y: number) => {
+      const o = (y * w + x) * 3;
+      return [out[o], out[o + 1], out[o + 2]];
+    };
+    assert.deepEqual(at(0, 0), [0, 0, 0]);
+    assert.deepEqual(at(5, 5), [55, 95, 175]);
+    assert.deepEqual(at(4, 6), [200, 160, 80]);
+  });
+});

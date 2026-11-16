@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Posewright",
+      "hasCanvas": false,
+      "bodyTextLen": 18,
+      "bodyTextHash": "3630fd8be7d76ffcaa68145893ac0ea91af8eb9ce843261713d6b8b338b25abf",
+      "bodyTextPrefix": "Opening the stage…",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Posewright",
+      "hasCanvas": true,
+      "bodyTextLen": 72,
+      "bodyTextHash": "df5c6dfb70a9115f0912d1672c8eba32facd6c5487f6b08a5e9f33b122897280",
+      "bodyTextPrefix": "Stage Figure Pose Export Orbit Fly FOV Frame all Frame Reset Und",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}

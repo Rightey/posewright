@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" role="img" aria-label="Posewright">
+  <rect width="32" height="32" rx="7" fill="#14181d"/>
+  <g fill="none" stroke="#d7c4b0" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M16 11.2V19.6"/>
+    <path d="M16 13.2 9.2 17.4"/>
+    <path d="M16 13.2 23.4 9.4"/>
+    <path d="M16 19.6 11 27.2"/>
+    <path d="M16 19.6 22.2 27.2"/>
+  </g>
+  <circle cx="16" cy="7.6" r="3.1" fill="#d7c4b0"/>
+  <circle cx="16" cy="13.2" r="1.4" fill="#e0a045"/>
+  <circle cx="23.4" cy="9.4" r="1.8" fill="#3ecfb2"/>
+</svg>

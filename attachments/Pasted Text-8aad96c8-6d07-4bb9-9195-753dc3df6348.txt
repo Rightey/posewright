@@ -1,0 +1,123 @@
+# ROLE
+You are a senior graphics/web engineer. Build a complete, locally-runnable 3D posing application in JavaScript. Work in phases, and after each phase run the app and verify it before moving on. Before writing code, give me a short plan (architecture, file tree, risks) and then proceed without waiting unless you hit a real blocker.
+# GOAL
+A desktop-browser app (no backend, no cloud services) where I can:
+1. Navigate freely in a 3D scene.
+2. Place and pose up to 4 human figures of different sexes, ages, and body types.
+3. Export PNG conditioning images from the current camera view: an OpenPose skeleton, a mesh wireframe, and supporting depth/normal/mask images.
+The exports are used in **ComfyUI** as ControlNet conditioning images, loaded with the Load Image node and fed straight into Apply ControlNet (no preprocessor node). They must be accurate, pixel-aligned with each other, and match the camera view exactly. PNG is the primary output format.
+# TECH CONSTRAINTS
+- JavaScript (ES modules; TypeScript only if I ask later).
+- Three.js for rendering, Vite for dev server/bundling.
+- Must run fully offline after `npm install`: `npm install && npm run dev` is the only setup. Also provide `npm run build` producing a static folder that works when served locally.
+- No external asset downloads at runtime. Generate the character meshes procedurally in code. If you bundle any asset, it must be CC0/permissive, committed to the repo, with its license noted.
+- Keep dependencies minimal (three, vite; optionally lil-gui or tweakpane for UI; vitest for tests).
+- Target: current Chrome, Firefox, Edge at 60fps with 4 figures.
+# SCENE & NAVIGATION
+- Ground grid, neutral background, simple lighting.
+- Two camera modes, toggled with a key and a UI button:
+  - Orbit mode (orbit/pan/zoom around a target).
+  - Fly mode (WASD + mouse look, Q/E for down/up, Shift for speed).
+- Adjustable camera FOV (default 50°, range 20-100°).
+- "Frame all figures" and "Reset camera" buttons.
+- An export-frame overlay showing the exact crop/aspect ratio that will be exported, driven by the chosen export resolution.
+# CHARACTERS
+Support 0-4 figures at once, each independently selectable, movable, rotatable, and deletable. "Add figure" is disabled at 4.
+Each figure has parametric controls:
+- Sex presentation: female / male / androgynous (a continuous slider blending proportions).
+- Age: child (~5), pre-teen (~10), teen (~15), young adult, adult, middle-aged, elderly. Age drives head-to-body ratio, limb-to-torso ratio, overall height, and posture (e.g., slight stoop for elderly).
+- Height in cm, constrained to sensible ranges for the chosen age.
+- Build: sliders for body mass and muscularity (not only presets).
+- Optional sub-proportions: shoulder width, hip width, torso length, leg length.
+- Named presets that set these sliders (e.g., "Adult female average", "Adult male muscular", "Child 6y", "Teen male slim", "Elderly female", "Heavy adult male").
+Implementation requirements:
+- One shared humanoid rig: a skeleton whose bone lengths are computed from the parameters above using anthropometric proportion tables. Document the numbers in a `proportions.js` file with comments.
+- The body mesh is a SkinnedMesh bound to that skeleton, generated procedurally (e.g., tapered capsules or lofted cross-sections per limb and torso, smoothly weighted at joints). Aim for roughly 3k-8k triangles per figure: low-poly enough that the wireframe export is clean and readable, smooth enough to read as a human form.
+- **Hands have articulated fingers** (a simple 3-bone chain per finger plus a thumb chain, 21 keypoints per hand to match OpenPose hand layout), with hand pose presets (open, relaxed, fist, point, grip). Keep finger geometry simple to protect the triangle budget.
+- **The head has face landmark anchors** (68 points in the standard face-landmark layout, plus the 5 OpenPose head points: nose, eyes, ears) defined as fixed offsets on the head bone, scaled by head size, so they stay correct for child and adult proportions.
+- Regenerating the mesh/skeleton when sliders change must be fast and must preserve the current pose (retarget joint rotations).
+- Each figure has a distinct editor color so I can tell them apart.
+# POSING
+- Forward kinematics: select a joint and rotate it with a rotation gizmo (TransformControls or equivalent).
+- Inverse kinematics: drag hands, feet, head, and pelvis targets with a translate gizmo; solve with FABRIK or CCD for arms and legs, with a spine/neck chain solver. Provide an FK/IK toggle per figure.
+- Joint limits (anatomically plausible ranges for elbows, knees, neck, spine, shoulders, hips, etc.) that can be toggled off.
+- Mirror pose option (copy left side to right and vice versa).
+- Move/rotate/scale the whole figure on the ground plane; "snap feet to ground" button.
+- Pose library: built-in presets (T-pose, A-pose, standing, walking, running, sitting, crouching, arms raised, fighting stance, etc.), plus Save/Load pose and Save/Load whole scene as JSON (download/upload files).
+- Undo/redo (at least 50 steps) covering pose changes, parameter changes, add/delete figure, and transforms.
+- Hover highlight and click-to-select on joints; joint handles are small spheres that can be hidden.
+# EXPORT TARGET: COMFYUI (PNG-FIRST)
+Every exported PNG must be:
+- 8-bit RGB, fully opaque (no alpha channel), sRGB, no color management tricks.
+- Dimensions are multiples of 8. Snap custom sizes to the nearest multiple of 8 and warn if not a multiple of 64.
+- Pixel-aligned with every other export: same camera, same crop, same resolution, so one latent size works for every ControlNet in the workflow.
+- Rendered offscreen at the exact requested size, independent of window size (support at least 4096 per side if the GPU allows), with no UI, grid, gizmos, or joint handles.
+- Resolution presets: 512x512, 512x768, 768x512, 768x768, 1024x1024, 832x1216, 1216x832, 896x1152, 1152x896, 1024x1536, plus custom W x H. (SD1.5 favors 512-768; SDXL favors ~1 megapixel buckets.)
+# EXPORT 1: OPENPOSE PNG
+Match the output of the `controlnet_aux` OpenPose/DWPose annotator, because that is what OpenPose ControlNet models were trained on.
+- Pure black (#000000) background, no grid, no UI, no lighting effects.
+- COCO-18 body keypoints (nose, neck, right shoulder, right elbow, right wrist, left shoulder, left elbow, left wrist, right hip, right knee, right ankle, left hip, left knee, left ankle, right eye, left eye, right ear, left ear) with the standard OpenPose limb connections and color palette.
+- Reproduce the `draw_bodypose` style: limbs as filled ellipses/polygons (stick width ~4 px at 512 px, scaled proportionally with resolution), limb colors dimmed to roughly 60% brightness, then keypoints drawn on top as filled circles (radius ~4 px at 512, scaled) in full keypoint color. Document the color table and its source in a code comment.
+- Keypoints are computed by projecting 3D joint positions (including derived points: neck as the midpoint between shoulders, and nose/eyes/ears from the head anchors) through the current camera to 2D pixels.
+- Left/right is from the figure's own perspective: a figure facing the camera has its right limb on the image-left.
+- Keypoints behind the camera or outside the frame are omitted along with their limbs. Self-occluded points are included by default (toggle).
+- **Second priority, behind a checkbox "Include hands and face" (DWPose-style):** 21 keypoints per hand drawn with the standard rainbow-colored hand edges plus keypoint dots, and 68 face landmarks as small white dots, derived from the finger bones and head anchors.
+- Show a UI warning when a figure is too small or heavily cropped (ControlNet works best when full figures are at least ~15-20% of the image height).
+- Also export OpenPose JSON in the format OpenPose writes (`people[].pose_keypoints_2d` as flat [x, y, confidence] arrays, plus hand and face arrays when enabled, with canvas width/height), for ComfyUI nodes that accept pose JSON.
+# EXPORT 2: MESH WIREFRAME PNG
+- Default: white lines on black (the convention for Canny/lineart-style ControlNets). An "invert" option gives black lines on white.
+- Options: line thickness (scaled with resolution), uniform white or per-figure color, hidden-line removal on/off (X-ray mode), and antialiasing off for crisp Canny-like lines.
+- Use a line approach that works cross-browser (e.g., Line2/LineSegments2 or a barycentric shader), since native WebGL line width is unreliable.
+- Generated from the exact same camera and crop as the OpenPose PNG.
+# EXPORT 3: ADDITIONAL CONDITIONING PNGs
+These reuse the mesh and camera, so they are cheap to produce:
+- **Depth map**: grayscale, white = near, black = far (MiDaS/ControlNet depth convention), black background, with a near/far normalization option (auto-fit to the figures).
+- **Normal map**: standard ControlNet normal-map color convention (flat (128,128,255)-style background), from the current camera.
+- **Mask PNGs**: one flat silhouette mask per figure (white on black), plus a combined color-coded mask. These serve regional prompting (one prompt per character) and inpainting.
+- **Per-figure OpenPose PNGs**: each figure alone on black, for running a separate ControlNet or prompt per character.
+# EXPORT UI & BUTTONS
+- Individual buttons for each PNG type.
+- "Export all" downloads a ZIP (store-only, hand-rolled writer is fine) containing: `openpose.png`, `wireframe.png`, `depth.png`, `normal.png`, `mask_combined.png`, `mask_figure1..4.png`, `openpose_figure1..4.png`, `openpose.json`, and `settings.json` (camera, resolution, figure parameters). Only include per-figure files for figures that exist.
+- Filenames and the ZIP include a timestamp.
+- Live preview panel showing each output type, updating as I pose, with a blend/overlay toggle (skeleton over wireframe, skeleton over the live viewport) to verify alignment.
+# UI/UX
+- Left panel: figure list (add, duplicate, delete, rename, show/hide), per-figure parameters and presets.
+- Right panel: pose tools (FK/IK toggle, mirror, joint limits, preset poses, hand presets, save/load) and export settings.
+- Bottom bar: camera mode, FOV, frame-all, reset, undo/redo.
+- Keyboard shortcuts with an on-screen cheat sheet (toggle with `?`): G/R for gizmo translate/rotate, Tab to cycle figures, Del to delete, Ctrl+Z / Ctrl+Shift+Z, F to frame selection, C to toggle camera mode, E to export.
+- Clean, dark, professional styling. Responsive to window resize. Tooltips on every control.
+# CODE QUALITY
+- Clear module structure, e.g.: `main.js`, `scene/`, `rig/` (skeleton, proportions, mesh generation, fingers, face anchors, IK, joint limits), `export/` (openpose.js, wireframe.js, depth.js, normals.js, masks.js, offscreenRender.js, zip.js), `ui/`, `state/` (scene state, undo/redo, serialization).
+- Keep scene state serializable and separate from Three.js objects so save/load and undo are reliable.
+- Comment non-obvious math (projection, IK, proportion tables).
+- Unit tests (Vitest) for pure logic: proportions calculation, COCO-18 keypoint derivation, projection-to-pixel, resolution snapping to multiples of 8, OpenPose JSON output shape, and scene serialization.
+- README covering: install/run steps, controls, how proportions are defined, how to add new body types or poses, and the ComfyUI usage notes below.
+# COMFYUI USAGE NOTES (put in README)
+- Load each PNG with a Load Image node and connect it to Apply ControlNet using the matching model (OpenPose/DWPose for the skeleton, Canny or Lineart for the wireframe, Depth, Normal).
+- Set Empty Latent Image to exactly the export resolution.
+- Suggested starting strengths: OpenPose 0.8-1.0, depth 0.5-0.7, wireframe/lineart 0.4-0.6. Combine them for best results.
+- Include a short example workflow description for multi-character scenes using the per-figure masks with regional prompting.
+- Note that preprocessors are not needed, since the images are already in training format.
+# BUILD PHASES (verify each before continuing)
+1. Project scaffold, scene, orbit + fly cameras, grid, resize handling, export-frame overlay.
+2. Parametric rig + procedural skinned mesh (with finger bones and face anchors) for one figure, with all sliders and presets.
+3. FK/IK posing, joint limits, mirror, pose and hand presets, selection UX.
+4. Multi-figure support (up to 4), transforms, figure list UI.
+5. Offscreen render pipeline and OpenPose export (body first, PNG + JSON), with preview.
+6. Wireframe, depth, normal, and mask exports; per-figure OpenPose PNGs; shared export settings; ZIP export.
+7. Hands and face in the OpenPose export.
+8. Undo/redo, save/load, shortcuts, polish, README, tests.
+# ACCEPTANCE CRITERIA
+- `npm install && npm run dev` works on a clean machine with no network access beyond the install.
+- I can add 4 figures of visibly different sexes, ages (child through elderly), and builds, pose them with IK and FK, and move through the scene in both camera modes.
+- All exported PNGs are 8-bit opaque RGB, multiples of 8 in size, and pixel-aligned: OpenPose overlays correctly on the wireframe, depth, and masks (verify with the blend toggle).
+- Left/right limbs are correct, colors match the controlnet_aux OpenPose palette, and keypoints stay correct for child-proportioned figures.
+- Exports render at the chosen resolution regardless of window size.
+- The exported PNGs load in ComfyUI via Load Image and work with the matching ControlNet models without a preprocessor.
+- "Export all" produces a ZIP with the full file set and timestamped names.
+- No console errors; sustained 60fps with 4 figures on a mid-range laptop.
+# HOW TO WORK
+- Ask me at most 3 clarifying questions up front, only if they would change the architecture. Otherwise state your assumptions and proceed.
+- At the end of each phase, summarize what works, what you tested, and what's next.
+- If something in this spec is infeasible or a poor trade-off, say so and propose an alternative rather than silently dropping it.
+- Prioritize correctness and alignment of the exports and posing feel over visual polish.
