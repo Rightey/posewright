@@ -133,6 +133,9 @@ export class FigureView {
   private lineB = new Vector3();
   private facePos = new Float32Array(68 * 3);
   private faceLinePos = new Float32Array(faceLineIndices().length * 3);
+  private faceTmp = new Vector3();
+  private faceLocal = Array.from({ length: 68 }, () => new Vector3());
+  private faceLineIndex = faceLineIndices();
   /** While a gizmo drags an IK helper, don't overwrite its position. */
   holdTarget: string | null = null;
 
@@ -340,7 +343,6 @@ export class FigureView {
     }
     this.group.updateWorldMatrix(true, true);
     this.syncMarkers();
-    this.syncFaceGuide();
     this.syncTargetHelpers();
   }
 
@@ -366,30 +368,33 @@ export class FigureView {
     this.faceLines.visible = show;
   }
 
-  private syncFaceGuide() {
+  /** Landmark overlay. Call after `setFaceGuide(true)` so hidden heads skip the work. */
+  syncFaceGuide() {
+    if (!this.facePoints.visible && !this.faceLines.visible) return;
     const len = headLength(this.segments);
     const pts = shapedLandmarks(len, this.data.face);
-    const tmp = new Vector3();
-    const local: Vector3[] = [];
+    const tmp = this.faceTmp;
+    const local = this.faceLocal;
     for (let i = 0; i < pts.length; i++) {
       const off = pts[i];
       const nudged = { x: off.x, y: off.y, z: off.z + len * 0.06 };
+      const slot = local[i];
       if (!this.localPoint("head", nudged, tmp)) {
-        local.push(new Vector3());
-        continue;
+        slot.set(0, 0, 0);
+      } else {
+        this.group.worldToLocal(tmp);
+        slot.copy(tmp);
       }
-      this.group.worldToLocal(tmp);
-      local.push(tmp.clone());
-      this.facePos[i * 3] = tmp.x;
-      this.facePos[i * 3 + 1] = tmp.y;
-      this.facePos[i * 3 + 2] = tmp.z;
+      this.facePos[i * 3] = slot.x;
+      this.facePos[i * 3 + 1] = slot.y;
+      this.facePos[i * 3 + 2] = slot.z;
     }
     const attr = this.facePoints.geometry.getAttribute("position");
     (attr.array as Float32Array).set(this.facePos);
     attr.needsUpdate = true;
-    const lines = faceLineIndices();
+    const lines = this.faceLineIndex;
     for (let i = 0; i < lines.length; i++) {
-      const p = local[lines[i]] ?? tmp;
+      const p = local[lines[i]];
       this.faceLinePos[i * 3] = p.x;
       this.faceLinePos[i * 3 + 1] = p.y;
       this.faceLinePos[i * 3 + 2] = p.z;

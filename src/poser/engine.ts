@@ -146,6 +146,8 @@ export class PoserEngine {
     align?: HTMLCanvasElement;
   } = {};
   private previewTimer = 0;
+  private previewRunning = false;
+  private previewQueued = false;
   private disposed = false;
   private cameraDirty = false;
   private depthScratch = new Vector3();
@@ -807,24 +809,40 @@ export class PoserEngine {
     for (const view of this.views) {
       view.rebuild();
       view.updateSkeleton(this.state.jointLimits, view.data.id === this.state.selection.figureId ? skip : null);
+    }
+    this.presentLiveView();
+    this.updateCrop();
+    this.drawViewportOverlay();
+    this.renderer.render(this.scene, this.camera);
+    if (this.cameraDirty && !this.previewRunning) {
+      this.cameraDirty = false;
+      this.schedulePreview();
+    } else {
+      this.cameraDirty = false;
+    }
+    this.raf = requestAnimationFrame(this.tick);
+  }
+
+  /** Put the shaded viewport back. Export passes borrow the same meshes. */
+  private presentLiveView() {
+    const bg = this.scene.background;
+    if (bg instanceof Color) bg.set("#14181d");
+    else this.scene.background = new Color("#14181d");
+    for (const helper of this.helpers) helper.visible = true;
+    this.grid.visible = this.state.showGrid;
+    this.gizmo.getHelper().visible = true;
+    for (const view of this.views) {
       const selected = view.data.id === this.state.selection.figureId;
+      view.mesh.material = view.beauty;
+      view.setViewportBody(this.state.showBody);
       view.setMarkerStyle(
         selected ? this.state.selection.bone : null,
         this.hoverBone,
         this.state.showJoints || !this.state.showBody,
       );
-      view.setViewportBody(this.state.showBody);
       view.setFaceGuide(view.data.detailedHead === true || (this.faceEdit && selected));
+      if (view.facePoints.visible) view.syncFaceGuide();
     }
-    this.grid.visible = this.state.showGrid;
-    this.updateCrop();
-    this.drawViewportOverlay();
-    this.renderer.render(this.scene, this.camera);
-    if (this.cameraDirty) {
-      this.cameraDirty = false;
-      this.schedulePreview();
-    }
-    this.raf = requestAnimationFrame(this.tick);
   }
 
   private stepFly(dt: number) {
@@ -1592,15 +1610,26 @@ export class PoserEngine {
   }
 
   private schedulePreview() {
+    if (this.disposed) return;
+    this.previewQueued = true;
+    if (this.previewRunning) return;
     window.clearTimeout(this.previewTimer);
-    this.previewTimer = window.setTimeout(() => void this.renderPreview(), 180);
+    this.previewTimer = window.setTimeout(() => void this.flushPreview(), 180);
   }
 
-  private async renderPreview() {
+  private async flushPreview() {
+    if (this.previewRunning || this.disposed) return;
+    this.previewRunning = true;
+    this.previewQueued = false;
     try {
       await this.renderPreviewInner();
     } catch (err) {
       console.error("preview failed", err);
+    } finally {
+      this.previewRunning = false;
+      // Orbit damping during a pass is not a new pose. Don't chain another full render off it.
+      this.cameraDirty = false;
+      if (this.previewQueued && !this.disposed) this.schedulePreview();
     }
   }
 
@@ -1711,6 +1740,7 @@ export class PoserEngine {
   dispose() {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
+    window.clearTimeout(this.previewTimer);
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);
     this.renderer.dispose();
