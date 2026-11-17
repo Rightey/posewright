@@ -98,3 +98,7 @@ For more than one character, export the per-figure masks and the per-figure Open
 3. For each character, a regional prompt masked by `mask_figureN.png`, optionally with `openpose_figureN.png` on a second OpenPose ControlNet so that character's pose stays locked while you change their prompt.
 
 If a figure is under about 18% of the frame height, the export panel warns you. ControlNet is much more reliable when the whole body is clearly in frame.
+
+## License
+
+Posewright is free software, released under the [GNU General Public License v3.0](LICENSE).
