@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore, type MutableRefObjec
 import { PoserEngine } from "../engine.ts";
 import { BODY_PRESETS } from "../state.ts";
 import { POSE_PRESETS, jointGroup, jointLabel, jointNames, limitsFor } from "../pose.ts";
-import { FACE_PRESETS } from "../face.ts";
+import { FACE_GROUPS, FACE_PRESETS, faceGroupOf } from "../face.ts";
 import { RESOLUTIONS, snapResolution } from "../resolution.ts";
 import { heightLimits } from "../proportions.ts";
 import type { BodyParams, FaceShape, FigureData, GizmoTool, HandPreset, ToePreset } from "../types.ts";
@@ -98,7 +98,7 @@ export function PoserApp() {
                 </button>
               </div>
               {workspace === "face" && selected ? (
-                <FacePanel engine={engine} figure={selected} />
+                <FacePanel engine={engine} figure={selected} facePoint={state.selection.facePoint ?? null} />
               ) : (
                 engine && selected && (
                   <PosePanel
@@ -857,14 +857,19 @@ function JointAccordion({
   );
 }
 
-function FacePanel({ engine, figure }: { engine: PoserEngine; figure: FigureData }) {
+function FacePanel({ engine, figure, facePoint }: { engine: PoserEngine; figure: FigureData; facePoint: number | null }) {
   const face = figure.face;
   const set = (patch: Partial<FaceShape>) => engine.setFace(figure.id, patch);
+  const [open, setOpen] = useState<string | null>(facePoint == null ? "Jaw" : faceGroupOf(facePoint).title);
+  useEffect(() => {
+    if (facePoint == null) return;
+    setOpen(faceGroupOf(facePoint).title);
+  }, [facePoint]);
   return (
     <div className="scroll-thin flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-3">
       <h2 className="text-sm font-semibold">Face</h2>
       <p className="text-xs text-muted">
-        These sliders move the 68 OpenPose face points. They are not extra body joints, and they do not change the head mesh. Turn on Detailed head to keep the points visible after you go back to the body.
+        Drag a point on the head. Arrows nudge it, Shift pushes it in or out, and Alt moves that point alone. Neighbors in the same region follow otherwise. The sliders still set the expression underneath.
       </p>
       <label className="flex min-h-11 items-center gap-2 text-sm" title="Show the landmark overlay on this figure in the main view">
         <input
@@ -874,6 +879,56 @@ function FacePanel({ engine, figure }: { engine: PoserEngine; figure: FigureData
         />
         Detailed head
       </label>
+      <label className="flex min-h-11 items-center gap-2 text-sm" title="Moving a point on one side moves the matching point on the other side">
+        <input
+          type="checkbox"
+          checked={figure.faceMirror !== false}
+          onChange={(e) => engine.setFaceMirror(figure.id, e.target.checked)}
+        />
+        Mirror
+      </label>
+      <button type="button" title="Clear dragged point offsets. Expression sliders stay as they are." className={btn()} onClick={() => engine.resetFaceOffsets(figure.id)}>
+        Reset points
+      </button>
+      <div className="rounded-md border border-line">
+        {FACE_GROUPS.map((group) => {
+          const expanded = open === group.title;
+          return (
+            <div key={group.id} className="border-b border-line last:border-b-0">
+              <button
+                type="button"
+                aria-expanded={expanded}
+                title={expanded ? `Collapse ${group.title}` : `Expand ${group.title}`}
+                className="flex min-h-11 w-full items-center justify-between gap-2 px-2 text-left text-xs text-muted hover:bg-surface-2"
+                onClick={() => setOpen(expanded ? null : group.title)}
+              >
+                <span>{group.title}</span>
+                <span className="font-mono">
+                  {expanded ? "−" : "+"} {group.names.length}
+                </span>
+              </button>
+              {expanded &&
+                group.names.map((name, i) => {
+                  const index = group.from + i;
+                  const o = figure.faceOffsets?.[index];
+                  const moved = !!o && (Math.abs(o.x) > 0.0008 || Math.abs(o.y) > 0.0008 || Math.abs(o.z) > 0.0008);
+                  return (
+                    <button
+                      key={index}
+                      type="button"
+                      title={`Select ${group.title} ${name}`}
+                      className={`flex min-h-11 w-full items-center justify-between gap-2 px-2 text-left text-sm ${facePoint === index ? "bg-surface-2 text-accent" : "hover:bg-surface-2"}`}
+                      onClick={() => engine.selectFacePoint(figure.id, index)}
+                    >
+                      <span>{name}</span>
+                      {moved && <span className="font-mono text-xs text-muted">moved</span>}
+                    </button>
+                  );
+                })}
+            </div>
+          );
+        })}
+      </div>
       <div>
         <p className="mb-1 text-xs text-muted">Expressions</p>
         <div className="flex flex-wrap gap-1">
@@ -889,7 +944,7 @@ function FacePanel({ engine, figure }: { engine: PoserEngine; figure: FigureData
       <Slider label="Brows" title="Negative lowers the brows, positive raises them" min={-1} max={1} step={0.01} value={face.brow} display={face.brow.toFixed(2)} onChange={(v) => set({ brow: v })} onDirty={() => engine.pushHistory()} />
       <Slider label="Blink" title="Closes both eyes" min={0} max={1} step={0.01} value={face.blink} display={face.blink.toFixed(2)} onChange={(v) => set({ blink: v })} onDirty={() => engine.pushHistory()} />
       <Slider label="Mouth width" title="1 is the resting mouth" min={0.55} max={1.7} step={0.01} value={face.mouth} display={face.mouth.toFixed(2)} onChange={(v) => set({ mouth: v })} onDirty={() => engine.pushHistory()} />
-      <p className="text-xs text-muted">Export includes these points when “Include hands and face” is on. The body plates stay the plain head either way.</p>
+      <p className="text-xs text-muted">Export includes these points when “Include hands and face” is on. Reset points clears the drags and leaves the sliders.</p>
     </div>
   );
 }
@@ -904,8 +959,10 @@ function Help({ onClose }: { onClose: () => void }) {
     ["Q / E", "Fly down / up (orbit: E exports)"],
     ["Shift", "Fly faster"],
     ["G / R", "Move gizmo / rotate gizmo"],
-    ["Arrows", "Nudge joint X and Y (Shift = 5°)"],
-    [", / .", "Nudge joint Z"],
+    ["Arrows", "Nudge joint, or the selected face point"],
+    [", / .", "Nudge joint Z, or a face point in and out"],
+    ["Alt", "Face: move only the grabbed point"],
+    ["Shift drag", "Face: push a point in or out"],
     ["F", "Frame selection"],
     ["Tab", "Next joint (Shift+Tab previous)"],
     ["[ / ]", "Previous / next figure"],

@@ -1,4 +1,4 @@
-import { NEUTRAL_FACE } from "./face.ts";
+import { NEUTRAL_FACE, emptyFaceOffsets } from "./face.ts";
 import { v3, type BodyParams, type ExportSettings, type FigureData, type SceneState } from "./types.ts";
 import { clampParams } from "./proportions.ts";
 import { poseById, writeHand, type Pose } from "./pose.ts";
@@ -85,6 +85,8 @@ export function makeFigure(index: number, presetId = "adult-f"): FigureData {
     detailedFeet: false,
     detailedHead: false,
     face: { ...NEUTRAL_FACE },
+    faceOffsets: emptyFaceOffsets(),
+    faceMirror: true,
   };
 }
 

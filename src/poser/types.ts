@@ -64,6 +64,10 @@ export type FigureData = {
   detailedHead: boolean;
   /** Deforms the OpenPose face points. The body mesh stays the plain head. */
   face: FaceShape;
+  /** Added to the shaped landmarks, in head-local space. One entry per iBUG point. */
+  faceOffsets: Vec3[];
+  /** A drag on one side of the face moves the mirrored point. */
+  faceMirror: boolean;
 };
 
 export type CameraMode = "orbit" | "fly";
@@ -86,7 +90,7 @@ export type ExportSettings = {
 
 export type SceneState = {
   figures: FigureData[];
-  selection: { figureId: string | null; bone: string | null };
+  selection: { figureId: string | null; bone: string | null; facePoint?: number | null };
   tool: GizmoTool;
   jointLimits: boolean;
   showJoints: boolean;

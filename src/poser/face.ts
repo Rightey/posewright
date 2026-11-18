@@ -189,3 +189,194 @@ export function faceLineIndices(): number[] {
     ...chain(seq(60, 67), true),
   ];
 }
+
+export type FaceGroup = {
+  id: string;
+  title: string;
+  from: number;
+  to: number;
+  /** Closed loops use the short way around, so the first and last points are neighbors. */
+  ring: boolean;
+  names: string[];
+};
+
+function faceGroup(id: string, title: string, from: number, to: number, ring: boolean, names: string[]): FaceGroup {
+  if (names.length !== to - from + 1) throw new Error(`${title} names do not match ${from}–${to}`);
+  return { id, title, from, to, ring, names };
+}
+
+/** Regions of the 68-point set. The list shows these, not one flat row per point. */
+export const FACE_GROUPS: FaceGroup[] = [
+  faceGroup("jaw", "Jaw", 0, 16, false, [
+    "Right ear",
+    "Right jaw 1",
+    "Right jaw 2",
+    "Right jaw 3",
+    "Right jaw 4",
+    "Right jaw 5",
+    "Right jaw 6",
+    "Right jaw 7",
+    "Chin",
+    "Left jaw 7",
+    "Left jaw 6",
+    "Left jaw 5",
+    "Left jaw 4",
+    "Left jaw 3",
+    "Left jaw 2",
+    "Left jaw 1",
+    "Left ear",
+  ]),
+  faceGroup("browR", "Right brow", 17, 21, false, ["Outer", "Outer mid", "Arch", "Inner mid", "Inner"]),
+  faceGroup("browL", "Left brow", 22, 26, false, ["Inner", "Inner mid", "Arch", "Outer mid", "Outer"]),
+  faceGroup("nose", "Nose", 27, 35, false, [
+    "Bridge top",
+    "Bridge",
+    "Bridge low",
+    "Tip",
+    "Right wing",
+    "Right base",
+    "Center",
+    "Left base",
+    "Left wing",
+  ]),
+  faceGroup("eyeR", "Right eye", 36, 41, true, ["Outer", "Upper outer", "Upper inner", "Inner", "Lower inner", "Lower outer"]),
+  faceGroup("eyeL", "Left eye", 42, 47, true, ["Outer", "Upper outer", "Upper inner", "Inner", "Lower inner", "Lower outer"]),
+  faceGroup("mouth", "Outer mouth", 48, 59, true, [
+    "Right corner",
+    "Upper 1",
+    "Upper 2",
+    "Upper center",
+    "Upper 4",
+    "Upper 5",
+    "Lower 1",
+    "Lower 2",
+    "Lower 3",
+    "Lower center",
+    "Lower 5",
+    "Lower 6",
+  ]),
+  faceGroup("inner", "Inner mouth", 60, 67, true, [
+    "Right",
+    "Upper 1",
+    "Upper center",
+    "Upper 3",
+    "Lower 1",
+    "Lower 2",
+    "Lower center",
+    "Lower 4",
+  ]),
+];
+
+export function faceGroupOf(index: number): FaceGroup {
+  return FACE_GROUPS.find((g) => index >= g.from && index <= g.to) ?? FACE_GROUPS[0];
+}
+
+const OFFSET_LIMIT = 0.12;
+
+export function emptyFaceOffsets(): Vec3[] {
+  return Array.from({ length: 68 }, () => ({ x: 0, y: 0, z: 0 }));
+}
+
+/** Missing or short lists become 68 zeros. Each axis stays inside a few centimeters. */
+export function clampFaceOffsets(raw?: Vec3[] | null): Vec3[] {
+  const out = emptyFaceOffsets();
+  if (!Array.isArray(raw)) return out;
+  for (let i = 0; i < 68; i++) {
+    const v = raw[i];
+    if (!v) continue;
+    out[i] = {
+      x: clip(v.x, -OFFSET_LIMIT, OFFSET_LIMIT, 0),
+      y: clip(v.y, -OFFSET_LIMIT, OFFSET_LIMIT, 0),
+      z: clip(v.z, -OFFSET_LIMIT, OFFSET_LIMIT, 0),
+    };
+  }
+  return out;
+}
+
+/** Shaped landmarks plus the hand-placed offsets. */
+export function posedLandmarks(headLen: number, face?: Partial<FaceShape> | null, offsets?: Vec3[] | null): Vec3[] {
+  const pts = shapedLandmarks(headLen, face);
+  const off = clampFaceOffsets(offsets);
+  for (let i = 0; i < 68; i++) {
+    pts[i].x += off[i].x;
+    pts[i].y += off[i].y;
+    pts[i].z += off[i].z;
+  }
+  return pts;
+}
+
+/** Partner index across the face, or null for a center point. X flips, Y and Z do not. */
+export const FACE_MIRROR: (number | null)[] = (() => {
+  const pts = faceLandmarks(1);
+  return pts.map((p, i) => {
+    let best = -1;
+    let bestD = 0.035;
+    for (let j = 0; j < pts.length; j++) {
+      if (j === i) continue;
+      const q = pts[j];
+      const d = Math.abs(p.x + q.x) + Math.abs(p.y - q.y) + Math.abs(p.z - q.z);
+      if (d < bestD) {
+        bestD = d;
+        best = j;
+      }
+    }
+    return best < 0 ? null : best;
+  });
+})();
+
+/** Weights for one drag. 1 on the grabbed point, falling off along its group. */
+export function faceWeights(index: number, isolate: boolean): Float64Array {
+  const w = new Float64Array(68);
+  if (index < 0 || index > 67) return w;
+  if (isolate) {
+    w[index] = 1;
+    return w;
+  }
+  const g = faceGroupOf(index);
+  const n = g.to - g.from + 1;
+  const sigma = 1.25;
+  const localIndex = index - g.from;
+  for (let i = g.from; i <= g.to; i++) {
+    let d = Math.abs(i - g.from - localIndex);
+    if (g.ring) d = Math.min(d, n - d);
+    const weight = Math.exp(-(d * d) / (sigma * sigma));
+    if (weight >= 0.05) w[i] = weight;
+  }
+  return w;
+}
+
+/**
+ * Copy `base` and add `delta`. Neighbors in the same region follow unless `isolate`.
+ * Mirror copies the move to the other side with X flipped, and does not stack on top of a stronger weight.
+ */
+export function applyFaceOffset(
+  base: Vec3[] | null | undefined,
+  index: number,
+  delta: Vec3,
+  opts: { isolate: boolean; mirror: boolean },
+): Vec3[] {
+  const out = clampFaceOffsets(base);
+  if (index < 0 || index > 67) return out;
+  const weights = faceWeights(index, opts.isolate);
+  const accW = new Float64Array(68);
+  const acc = emptyFaceOffsets();
+  const consider = (i: number, d: Vec3, w: number) => {
+    if (i < 0 || i > 67 || w <= accW[i]) return;
+    accW[i] = w;
+    acc[i] = { x: d.x * w, y: d.y * w, z: d.z * w };
+  };
+  for (let i = 0; i < 68; i++) {
+    const w = weights[i];
+    if (w < 0.05) continue;
+    consider(i, delta, w);
+    if (!opts.mirror) continue;
+    const partner = FACE_MIRROR[i];
+    if (partner == null) continue;
+    consider(partner, { x: -delta.x, y: delta.y, z: delta.z }, w);
+  }
+  for (let i = 0; i < 68; i++) {
+    if (accW[i] <= 0) continue;
+    out[i] = { x: out[i].x + acc[i].x, y: out[i].y + acc[i].y, z: out[i].z + acc[i].z };
+  }
+  return clampFaceOffsets(out);
+}

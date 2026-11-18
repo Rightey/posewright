@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { PerspectiveCamera, Raycaster, Vector3 } from "three";
 import { FigureView } from "./figure.ts";
-import { faceLandmarks, shapedLandmarks } from "./face.ts";
+import { FACE_GROUPS, FACE_MIRROR, applyFaceOffset, emptyFaceOffsets, faceLandmarks, faceWeights, posedLandmarks, shapedLandmarks } from "./face.ts";
 import { fabrik, solveElbow } from "./ik.ts";
 import { flattenKeys, openPoseJson, type PersonPose } from "./openpose.ts";
 import { animaOutline, animaStrokePx } from "./outline.ts";
@@ -341,6 +341,41 @@ describe("face", () => {
       return hi - lo;
     };
     assert.ok(span(shut, 36, 41) < span(rest, 36, 41));
+  });
+
+  it("covers every landmark with one group", () => {
+    const seen = new Set<number>();
+    for (const group of FACE_GROUPS) {
+      assert.equal(group.names.length, group.to - group.from + 1);
+      for (let i = group.from; i <= group.to; i++) {
+        assert.equal(seen.has(i), false);
+        seen.add(i);
+      }
+    }
+    assert.equal(seen.size, 68);
+  });
+
+  it("moves neighbors unless the drag is isolated, and mirrors X", () => {
+    const zeros = emptyFaceOffsets();
+    const chin = applyFaceOffset(zeros, 8, { x: 0, y: -0.02, z: 0 }, { isolate: false, mirror: true });
+    assert.ok(Math.abs(chin[8].y + 0.02) < 1e-6);
+    assert.ok(chin[7].y < -0.005 && chin[7].y > chin[8].y);
+    assert.ok(Math.abs(chin[0].y) < 1e-4);
+    const alone = applyFaceOffset(zeros, 8, { x: 0, y: -0.02, z: 0 }, { isolate: true, mirror: false });
+    assert.ok(Math.abs(alone[8].y + 0.02) < 1e-6);
+    assert.ok(Math.abs(alone[7].y) < 1e-6);
+    const partner = FACE_MIRROR[36];
+    assert.ok(partner != null && partner !== 36);
+    assert.equal(FACE_MIRROR[partner], 36);
+    const eye = applyFaceOffset(zeros, 36, { x: 0.02, y: 0, z: 0 }, { isolate: true, mirror: true });
+    assert.ok(Math.abs(eye[36].x - 0.02) < 1e-6);
+    assert.ok(Math.abs(eye[partner].x + 0.02) < 1e-6);
+    const weights = faceWeights(8, false);
+    assert.equal(weights[8], 1);
+    assert.ok(weights[7] < 1 && weights[7] > 0.4);
+    assert.equal(weights[0], 0);
+    const posed = posedLandmarks(0.22, { jaw: 0, smile: 0, brow: 0, blink: 0, mouth: 1 }, chin);
+    assert.ok(posed[8].y < shapedLandmarks(0.22)[8].y - 0.01);
   });
 });
 

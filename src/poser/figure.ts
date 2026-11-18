@@ -23,7 +23,7 @@ import {
   Vector3,
 } from "three";
 import type { PerspectiveCamera } from "three";
-import { clampFace, faceLineIndices, headAnchors, shapedLandmarks } from "./face.ts";
+import { clampFace, clampFaceOffsets, faceLineIndices, headAnchors, posedLandmarks } from "./face.ts";
 import { solveIk } from "./ik.ts";
 import { buildFigureGeometry } from "./mesh.ts";
 import type { PersonPose, Keypoint } from "./openpose.ts";
@@ -132,6 +132,7 @@ export class FigureView {
   private lineA = new Vector3();
   private lineB = new Vector3();
   private facePos = new Float32Array(68 * 3);
+  private faceColor = new Float32Array(68 * 3);
   private faceLinePos = new Float32Array(faceLineIndices().length * 3);
   private faceTmp = new Vector3();
   private faceLocal = Array.from({ length: 68 }, () => new Vector3());
@@ -142,6 +143,8 @@ export class FigureView {
   constructor(data: FigureData) {
     this.data = data;
     this.data.face = clampFace(data.face);
+    this.data.faceOffsets = clampFaceOffsets(data.faceOffsets);
+    if (typeof data.faceMirror !== "boolean") this.data.faceMirror = true;
     this.data.detailedHead = data.detailedHead === true;
     this.data.detailedFeet = data.detailedFeet === true;
     this.beauty = new MeshStandardMaterial({
@@ -178,11 +181,18 @@ export class FigureView {
     this.boneLines.frustumCulled = false;
     this.boneLines.visible = false;
     const faceGeo = new BufferGeometry();
+    for (let i = 0; i < 68; i++) {
+      this.faceColor[i * 3] = 0xe7 / 255;
+      this.faceColor[i * 3 + 1] = 0xeb / 255;
+      this.faceColor[i * 3 + 2] = 0xe6 / 255;
+    }
     faceGeo.setAttribute("position", new Float32BufferAttribute(this.facePos, 3));
+    faceGeo.setAttribute("color", new Float32BufferAttribute(this.faceColor, 3));
     this.facePoints = new Points(
       faceGeo,
       new PointsMaterial({
-        color: "#e7ebe6",
+        color: "#ffffff",
+        vertexColors: true,
         size: 7,
         sizeAttenuation: false,
         depthTest: false,
@@ -372,7 +382,7 @@ export class FigureView {
   syncFaceGuide() {
     if (!this.facePoints.visible && !this.faceLines.visible) return;
     const len = headLength(this.segments);
-    const pts = shapedLandmarks(len, this.data.face);
+    const pts = posedLandmarks(len, this.data.face, this.data.faceOffsets);
     const tmp = this.faceTmp;
     const local = this.faceLocal;
     for (let i = 0; i < pts.length; i++) {
@@ -402,6 +412,32 @@ export class FigureView {
     const lineAttr = this.faceLines.geometry.getAttribute("position");
     (lineAttr.array as Float32Array).set(this.faceLinePos);
     lineAttr.needsUpdate = true;
+  }
+
+  /** World position of one landmark. Positions are group-local until the guide syncs. */
+  faceWorld(index: number, out: Vector3): boolean {
+    if (index < 0 || index > 67) return false;
+    out.set(this.facePos[index * 3], this.facePos[index * 3 + 1], this.facePos[index * 3 + 2]);
+    this.group.localToWorld(out);
+    return true;
+  }
+
+  /** Amber is selected, teal is hovered, bone is a point that has been moved. */
+  tintFacePoints(selected: number | null, hover: number | null) {
+    const offsets = this.data.faceOffsets;
+    for (let i = 0; i < 68; i++) {
+      const o = offsets?.[i];
+      const moved = !!o && o.x * o.x + o.y * o.y + o.z * o.z > 1e-8;
+      let hex = moved ? 0xd7c4b0 : 0xe7ebe6;
+      if (i === hover && i !== selected) hex = 0x3ecfb2;
+      if (i === selected) hex = 0xe0a045;
+      this.faceColor[i * 3] = ((hex >> 16) & 255) / 255;
+      this.faceColor[i * 3 + 1] = ((hex >> 8) & 255) / 255;
+      this.faceColor[i * 3 + 2] = (hex & 255) / 255;
+    }
+    const attr = this.facePoints.geometry.getAttribute("color");
+    (attr.array as Float32Array).set(this.faceColor);
+    attr.needsUpdate = true;
   }
 
   private syncTargetHelpers() {
@@ -575,7 +611,7 @@ export class FigureView {
 
   private sampleFace(project: (w: Vector3) => Keypoint): Keypoint[] {
     const len = headLength(this.segments);
-    return shapedLandmarks(len, this.data.face).map((off) => {
+    return posedLandmarks(len, this.data.face, this.data.faceOffsets).map((off) => {
       const p = new Vector3();
       if (!this.localPoint("head", off, p)) return { x: 0, y: 0, c: 0 };
       return project(p);

@@ -15,6 +15,7 @@ import {
   SRGBColorSpace,
   Vector2,
   Vector3,
+  Matrix4,
   WebGLRenderer,
   WebGLRenderTarget,
   type Object3D,
@@ -22,7 +23,7 @@ import {
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { createDepthMaterial, FigureView } from "./figure.ts";
-import { FACE_PRESETS, clampFace } from "./face.ts";
+import { FACE_PRESETS, applyFaceOffset, clampFace, clampFaceOffsets } from "./face.ts";
 import { bodyCoverage, drawOpenPose, openPoseJson, type PersonPose } from "./openpose.ts";
 import { mirrorPose, poseById, writeHand, writeToes, composedEuler, clampEuler, jointNames, jointsToPose, poseToJoints, type Pose } from "./pose.ts";
 import { canvasToRgb, linearRgbToSrgb, pngBlob, rgbaToRgb } from "./png.ts";
@@ -37,7 +38,7 @@ import {
   makeFigure,
   stamp,
 } from "./state.ts";
-import type { BodyParams, CameraMode, FaceShape, FigureData, GizmoTool, HandPreset, SceneState, ToePreset } from "./types.ts";
+import type { BodyParams, CameraMode, FaceShape, FigureData, GizmoTool, HandPreset, SceneState, ToePreset, Vec3 } from "./types.ts";
 import { zipBlob, type ZipItem } from "./zip.ts";
 
 /** Offscreen targets are linear, so keep the sRGB byte values we want in the PNG. */
@@ -321,6 +322,7 @@ export class PoserEngine {
     this.state.figures = data.figures;
     this.state.selection = data.selection;
     this.state.jointLimits = data.jointLimits;
+    for (const fig of this.state.figures) this.normalizeFigure(fig);
     const live = new Map(this.views.map((v) => [v.data.id, v]));
     const next: FigureView[] = [];
     for (const fig of this.state.figures) {
@@ -459,6 +461,35 @@ export class PoserEngine {
     this.emit();
   }
 
+  selectFacePoint(figureId: string, index: number | null) {
+    this.state.selection = { figureId, bone: null, facePoint: index };
+    this.touch();
+  }
+
+  setFaceMirror(id: string, on: boolean) {
+    const fig = this.state.figures.find((f) => f.id === id);
+    if (!fig || fig.faceMirror === on) return;
+    this.pushHistory();
+    fig.faceMirror = on;
+    this.emit();
+  }
+
+  resetFaceOffsets(id: string) {
+    const fig = this.state.figures.find((f) => f.id === id);
+    if (!fig) return;
+    this.pushHistory();
+    fig.faceOffsets = clampFaceOffsets(null);
+    this.emit();
+  }
+
+  private normalizeFigure(fig: FigureData) {
+    fig.detailedFeet = fig.detailedFeet === true;
+    fig.detailedHead = fig.detailedHead === true;
+    fig.face = clampFace(fig.face);
+    fig.faceOffsets = clampFaceOffsets(fig.faceOffsets);
+    if (typeof fig.faceMirror !== "boolean") fig.faceMirror = true;
+  }
+
   /**
    * Face tab. Frames the selected head from the front when opening, or when
    * the selected figure changes while the tab is already open.
@@ -466,10 +497,16 @@ export class PoserEngine {
   setFaceEdit(on: boolean, frame = false) {
     const changed = this.faceEdit !== on;
     this.faceEdit = on;
+    if (!on) {
+      this.faceDrag = null;
+      this.hoverFace = null;
+      if (this.mode === "orbit") this.orbit.enabled = true;
+    }
     if (on && (changed || frame)) this.frameHead();
     if (!on && changed && this.mode === "orbit") {
       this.hint.textContent = "Orbit · left drag look · right drag pan · scroll zoom";
     }
+    this.syncGizmo();
     if (changed) this.emit();
   }
 
@@ -489,7 +526,7 @@ export class PoserEngine {
     this.camera.position.copy(center).addScaledVector(front, dist);
     this.orbit.update();
     this.syncFlyFromCamera();
-    this.hint.textContent = "Face · orbit the head · sliders change the OpenPose landmarks";
+    this.hint.textContent = "Face · drag a point · arrows nudge · Alt one point · Shift in/out";
     this.cameraDirty = true;
   }
 
@@ -587,7 +624,7 @@ export class PoserEngine {
   }
 
   selectBone(figureId: string, bone: string | null) {
-    this.state.selection = { figureId, bone };
+    this.state.selection = { figureId, bone, facePoint: null };
     if (bone) this.state.tool = "rotate";
     this.touch();
   }
@@ -841,7 +878,11 @@ export class PoserEngine {
         this.state.showJoints || !this.state.showBody,
       );
       view.setFaceGuide(view.data.detailedHead === true || (this.faceEdit && selected));
-      if (view.facePoints.visible) view.syncFaceGuide();
+      if (view.facePoints.visible) {
+        view.syncFaceGuide();
+        const point = selected ? (this.state.selection.facePoint ?? null) : null;
+        view.tintFacePoints(point, selected ? this.hoverFace : null);
+      }
     }
   }
 
@@ -867,14 +908,33 @@ export class PoserEngine {
   }
 
   private hoverBone: string | null = null;
+  private hoverFace: number | null = null;
+  private faceDrag: { index: number; x: number; y: number; pushed: boolean; base: Vec3[] } | null = null;
+  private faceA = new Vector3();
+  private faceB = new Vector3();
+  private faceC = new Vector3();
+  private faceM = new Matrix4();
   private down = { x: 0, y: 0 };
 
   private onPointerDown = (e: PointerEvent) => {
     this.down.x = e.clientX;
     this.down.y = e.clientY;
+    if (!this.faceEdit || e.button !== 0) return;
+    const hit = this.pickFacePoint(e);
+    const view = this.selected();
+    if (hit == null || !view) return;
+    this.faceDrag = { index: hit, x: e.clientX, y: e.clientY, pushed: false, base: clone(view.data.faceOffsets) };
+    this.orbit.enabled = false;
+    this.state.selection = { figureId: view.data.id, bone: null, facePoint: hit };
+    this.renderer.domElement.setPointerCapture(e.pointerId);
+    this.touch();
   };
 
   private onPointerMove = (e: PointerEvent) => {
+    if (this.faceDrag) {
+      this.updateFaceDrag(e);
+      return;
+    }
     if (document.pointerLockElement === this.renderer.domElement && this.mode === "fly") {
       this.fly.yaw -= e.movementX * 0.0022;
       this.fly.pitch -= e.movementY * 0.0022;
@@ -886,9 +946,19 @@ export class PoserEngine {
     const markers = this.views.flatMap((v) => (v.data.visible ? [...v.markers.values()] : []));
     const hit = this.raycaster.intersectObjects(markers, false)[0];
     this.hoverBone = hit ? (hit.object.userData.bone as string) : null;
+    this.hoverFace = this.faceEdit ? this.pickFacePoint(e) : null;
+    this.renderer.domElement.style.cursor = this.hoverFace != null ? "pointer" : "";
   };
 
   private onPointerUp = (e: PointerEvent) => {
+    if (this.faceDrag) {
+      const moved = this.faceDrag.pushed;
+      this.faceDrag = null;
+      if (this.mode === "orbit") this.orbit.enabled = true;
+      this.renderer.domElement.style.cursor = "";
+      if (moved) this.emit();
+      return;
+    }
     if (this.suppressPick) {
       this.suppressPick = false;
       return;
@@ -896,6 +966,12 @@ export class PoserEngine {
     const dx = e.clientX - this.down.x;
     const dy = e.clientY - this.down.y;
     if (dx * dx + dy * dy > 16) return;
+    if (this.faceEdit) {
+      const hit = this.pickFacePoint(e);
+      this.state.selection = { figureId: this.state.selection.figureId, bone: null, facePoint: hit };
+      this.touch();
+      return;
+    }
     this.pointerFrom(e);
     this.raycaster.setFromCamera(this.pointer, this.camera);
     const pickable = this.state.showJoints || !this.state.showBody;
@@ -905,6 +981,7 @@ export class PoserEngine {
       this.state.selection = {
         figureId: hit.object.userData.figureId as string,
         bone: hit.object.userData.bone as string,
+        facePoint: null,
       };
       this.touch();
       return;
@@ -913,11 +990,11 @@ export class PoserEngine {
     const body = this.raycaster.intersectObjects(meshes, false)[0];
     if (body) {
       const view = this.views.find((v) => v.mesh === body.object);
-      if (view) this.state.selection = { figureId: view.data.id, bone: null };
+      if (view) this.state.selection = { figureId: view.data.id, bone: null, facePoint: null };
       this.touch();
       return;
     }
-    this.state.selection = { figureId: this.state.selection.figureId, bone: null };
+    this.state.selection = { figureId: this.state.selection.figureId, bone: null, facePoint: null };
     this.touch();
   };
 
@@ -925,6 +1002,109 @@ export class PoserEngine {
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  }
+
+  /** Nearest landmark under the cursor, in the selected figure only. */
+  private pickFacePoint(e: PointerEvent): number | null {
+    const view = this.selected();
+    if (!view || !view.facePoints.visible) return null;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    let best = -1;
+    let bestD = 16 * 16;
+    for (let i = 0; i < 68; i++) {
+      if (!view.faceWorld(i, this.faceA)) continue;
+      this.faceA.project(this.camera);
+      if (this.faceA.z < -1 || this.faceA.z > 1) continue;
+      const sx = (this.faceA.x * 0.5 + 0.5) * rect.width;
+      const sy = (-this.faceA.y * 0.5 + 0.5) * rect.height;
+      const d = (sx - x) * (sx - x) + (sy - y) * (sy - y);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    return best < 0 ? null : best;
+  }
+
+  /** Screen pixels to a head-local move. Shift keeps only the in/out axis. */
+  private faceScreenDelta(view: FigureView, index: number, dxPx: number, dyPx: number, depth: boolean): Vec3 {
+    const head = view.bones.get("head");
+    if (!head || !view.faceWorld(index, this.faceA)) return { x: 0, y: 0, z: 0 };
+    const dist = Math.max(0.05, this.camera.position.distanceTo(this.faceA));
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const worldPerPx = (2 * Math.tan((this.camera.fov * Math.PI) / 360) * dist) / Math.max(1, rect.height);
+    const world = this.faceB;
+    if (depth) {
+      world.set(0, 0, 1).transformDirection(head.matrixWorld).multiplyScalar(-dyPx * worldPerPx);
+    } else {
+      const right = this.faceC.set(1, 0, 0).applyQuaternion(this.camera.quaternion);
+      const up = this.faceA.set(0, 1, 0).applyQuaternion(this.camera.quaternion);
+      world.copy(right).multiplyScalar(dxPx * worldPerPx).addScaledVector(up, -dyPx * worldPerPx);
+    }
+    const origin = this.faceC.setFromMatrixPosition(head.matrixWorld);
+    const end = this.faceA.copy(origin).add(world);
+    this.faceM.copy(head.matrixWorld).invert();
+    origin.applyMatrix4(this.faceM);
+    end.applyMatrix4(this.faceM);
+    end.sub(origin);
+    if (depth) return { x: 0, y: 0, z: end.z };
+    return { x: end.x, y: end.y, z: 0 };
+  }
+
+  private updateFaceDrag(e: PointerEvent) {
+    const drag = this.faceDrag;
+    const view = this.selected();
+    if (!drag || !view) return;
+    const dx = e.clientX - drag.x;
+    const dy = e.clientY - drag.y;
+    if (!drag.pushed && dx * dx + dy * dy < 4) return;
+    if (!drag.pushed) {
+      this.pushHistory();
+      drag.pushed = true;
+    }
+    const delta = this.faceScreenDelta(view, drag.index, dx, dy, e.shiftKey);
+    view.data.faceOffsets = applyFaceOffset(drag.base, drag.index, delta, {
+      isolate: e.altKey,
+      mirror: view.data.faceMirror !== false,
+    });
+    this.renderer.domElement.style.cursor = "grabbing";
+  }
+
+  private nudgeFacePoint(index: number, code: string, shift: boolean, isolate: boolean) {
+    const view = this.selected();
+    if (!view) return;
+    const px = shift ? 28 : 8;
+    let dx = 0;
+    let dy = 0;
+    let depth = false;
+    if (code === "ArrowRight" || code === "Numpad6") dx = px;
+    else if (code === "ArrowLeft" || code === "Numpad4") dx = -px;
+    else if (code === "ArrowUp" || code === "Numpad8") dy = -px;
+    else if (code === "ArrowDown" || code === "Numpad2") dy = px;
+    else if (code === "Period" || code === "Numpad3") {
+      depth = true;
+      dy = -px;
+    } else if (code === "Comma" || code === "Numpad1") {
+      depth = true;
+      dy = px;
+    } else return;
+    const delta = this.faceScreenDelta(view, index, dx, dy, depth);
+    view.data.faceOffsets = applyFaceOffset(view.data.faceOffsets, index, delta, {
+      isolate,
+      mirror: view.data.faceMirror !== false,
+    });
+    this.emit();
+  }
+
+  private cycleFacePoint(dir: number) {
+    const view = this.selected();
+    if (!view) return;
+    const cur = this.state.selection.facePoint;
+    const i = cur == null || cur < 0 || cur > 67 ? (dir > 0 ? -1 : 0) : cur;
+    const next = (i + dir + 68) % 68;
+    this.selectFacePoint(view.data.id, next);
   }
 
   private typingTarget(target: EventTarget | null): boolean {
@@ -956,7 +1136,8 @@ export class PoserEngine {
     }
     if (e.key === "Tab") {
       e.preventDefault();
-      this.cycleJoint(e.shiftKey ? -1 : 1);
+      if (this.faceEdit) this.cycleFacePoint(e.shiftKey ? -1 : 1);
+      else this.cycleJoint(e.shiftKey ? -1 : 1);
       return;
     }
     if (e.key === "[" || e.key === "]") {
@@ -964,9 +1145,20 @@ export class PoserEngine {
       this.cycleFigure(e.key === "]" ? 1 : -1);
       return;
     }
-    if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (!e.ctrlKey && !e.metaKey) {
       const nudge = nudgeFromCode(e.code);
-      if (nudge && this.state.selection.bone) {
+      if (nudge && this.faceEdit) {
+        const point = this.state.selection.facePoint;
+        if (point != null) {
+          e.preventDefault();
+          if (!e.repeat) this.pushHistory();
+          this.nudgeFacePoint(point, e.code, e.shiftKey, e.altKey);
+        } else {
+          e.preventDefault();
+        }
+        return;
+      }
+      if (nudge && !e.altKey && this.state.selection.bone) {
         e.preventDefault();
         if (!e.repeat) this.pushHistory();
         const step = e.shiftKey ? 5 : 1;
@@ -997,6 +1189,10 @@ export class PoserEngine {
   onHelp: (() => void) | null = null;
 
   private syncGizmo() {
+    if (this.faceEdit) {
+      this.gizmo.detach();
+      return;
+    }
     const view = this.selected();
     this.gizmo.enabled = this.mode === "orbit";
     if (!view || this.mode === "fly") {
@@ -1476,9 +1672,7 @@ export class PoserEngine {
     this.state.export = { ...this.state.export, ...data.state.export };
     this.state.tool = data.state.tool ?? "rotate";
     for (const fig of this.state.figures) {
-      fig.detailedFeet = fig.detailedFeet === true;
-      fig.detailedHead = fig.detailedHead === true;
-      fig.face = clampFace(fig.face);
+      this.normalizeFigure(fig);
       this.attachView(fig, false);
     }
     if (data.camera) this.applyCamera(data.camera);
@@ -1520,6 +1714,8 @@ export class PoserEngine {
       detailedFeet: fig.detailedFeet === true,
       detailedHead: fig.detailedHead === true,
       face: clampFace(fig.face),
+      faceOffsets: clampFaceOffsets(fig.faceOffsets),
+      faceMirror: fig.faceMirror !== false,
     };
     const slug = fig.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "figure";
     downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }), `${slug}-${stamp()}.json`);
@@ -1560,6 +1756,8 @@ export class PoserEngine {
       detailedFeet?: boolean;
       detailedHead?: boolean;
       face?: FigureData["face"];
+      faceOffsets?: FigureData["faceOffsets"];
+      faceMirror?: boolean;
     };
     const pose = poseFromFile(data);
     if (!pose && !data.params) throw new Error("That file is not a Posewright figure.");
@@ -1576,6 +1774,8 @@ export class PoserEngine {
     if (typeof data.detailedFeet === "boolean") view.data.detailedFeet = data.detailedFeet;
     if (typeof data.detailedHead === "boolean") view.data.detailedHead = data.detailedHead;
     if (data.face) view.data.face = clampFace(data.face);
+    if (data.faceOffsets) view.data.faceOffsets = clampFaceOffsets(data.faceOffsets);
+    if (typeof data.faceMirror === "boolean") view.data.faceMirror = data.faceMirror;
     view.rebuild(true);
     view.updateSkeleton(this.state.jointLimits, null);
     view.captureTargets();
